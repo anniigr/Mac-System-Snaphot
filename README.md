@@ -1,219 +1,270 @@
 # Mac System Snapshot
 
-A native macOS utility built with Swift and SwiftUI that captures and displays a point-in-time overview of the current Mac. System information is collected through standard Apple APIs with App Sandbox enabled.
+A small native macOS app, written in Swift and SwiftUI, that captures a point-in-time snapshot
+of the Mac it runs on: device name, macOS version, processor architecture and active core
+count, installed memory, and total and available disk space. Each capture is kept in a
+ten-entry history persisted as JSON inside the App Sandbox container, can be re-selected from
+a sidebar, and exported as a standalone JSON file through the native save panel.
 
-Built as a focused Swift and SwiftUI portfolio project, the app combines native system information access, a small MVVM architecture, local JSON history, and sandbox-compatible export. **All four implementation milestones are complete, and all 16 XCTest tests passed locally on a MacBook Air M3.**
+The project is deliberately narrow so that the interesting parts are visible: a protocol-driven
+MVVM core, explicit error states for collection, persistence and export, and an XCTest suite
+that exercises the ViewModel through injected fakes.
+
+## Preview
+
+Captures of the app built from this repository and running on macOS 27 (Apple silicon).
+
+![Launch sequence: empty state, then history restored and a fresh capture selected](docs/screenshots/launch.gif)
+
+![Main window with the ten-entry history sidebar and the selected snapshot](docs/screenshots/01-main-window.png)
+
+![History file deliberately corrupted before launch: the app keeps the new capture in memory, leaves the file untouched and offers Retry save](docs/screenshots/02-history-error.png)
+
+The storage card (available and total space with a progress bar and percentage) sits below the
+memory card and is reached by scrolling.
 
 ## Features
 
-- Device name and macOS version.
-- Processor architecture and active logical processor count.
-- Installed physical memory.
-- Total and available space on the volume containing the app's home directory.
-- Capture timestamp for each snapshot.
-- Manual refresh using the Refresh button or Command-R while the app is focused.
-- Refined SwiftUI interface with System, Memory, and Storage sections.
-- Adaptive card layout, selectable values, scrolling, and a minimum window size.
-- Available disk percentage and a visual availability indicator.
-- Native refresh toolbar, empty state, and an error banner with Retry.
-- Local JSON persistence and restoration of history on launch.
-- History sidebar with selection of the latest ten captures.
-- Export of the selected snapshot as JSON through a native save dialog (Command-E).
-- Separate collection, persistence, and export errors with retry actions.
-- Failed refreshes preserve existing snapshots; failed saves retain changes in memory.
-- Unreadable history is not automatically overwritten.
-- 16 XCTest tests covering formatting, calculations, serialization, storage, and ViewModel recovery.
-
-Snapshots are collected on initial display and on demand. The app does not continuously monitor CPU load or memory usage. After successful captures, the app attempts to save history; persistence failures are shown separately. Export creates a separate copy of the selected snapshot.
-
-## Technologies
-
-- Swift and SwiftUI
-- Foundation for system information, dates, and formatting
-- Darwin for processor architecture detection through `sysctlbyname`
-- Combine for `ObservableObject` and `@Published`
-- App Sandbox
-- AppKit and Uniform Type Identifiers for the native JSON export dialog
-- XCTest for automated tests
-
-No third-party packages, shell subprocesses, networking, or database are used.
+- Captures device name, macOS version, `arm64`/`x86_64` architecture, active logical processor
+  count, physical memory, and total and available space of the volume holding the home
+  directory.
+- Captures on first display and on demand (Refresh button or `⌘R`); the app does not poll.
+- History of the latest ten captures, newest first, restored on launch and shown in a sidebar.
+  Selecting an older row shows it without capturing or saving.
+- Export of the selected snapshot as pretty-printed JSON through `NSSavePanel` (`⌘E`).
+- Three independent error banners, each with its own retry: collection failed (previous
+  snapshots unchanged), history could not be loaded or saved (captures stay in memory, file is
+  never overwritten), export failed.
+- App Sandbox enabled; the only file access outside the container is the user-selected export
+  destination.
+- Light and dark appearance, adaptive one- or two-column card layout, selectable values,
+  minimum window size.
 
 ## Architecture
 
-The application uses a MVVM structure. `SystemSnapshot` is an immutable value model. `SystemInfoService` collects data, `SnapshotViewModel` coordinates captures, history, selection, and errors. `ContentView` renders the sidebar and page state; `SnapshotDetailView` renders the selected capture. The service is injected through `SystemInfoProviding` to test ViewModel behavior with controlled inputs. Storage is also injected through a protocol so tests can simulate read and write failures.
+```mermaid
+flowchart LR
+    subgraph App
+        A["MacSystemSnapshotApp<br/>@StateObject SnapshotViewModel"]
+    end
+    subgraph Views
+        CV[ContentView<br/>NavigationSplitView, toolbar,<br/>error banners, empty state]
+        DV[SnapshotDetailView<br/>device header, System / Memory / Storage cards]
+    end
+    subgraph ViewModel["ViewModel, @MainActor"]
+        VM[SnapshotViewModel<br/>snapshots, selectedSnapshotID,<br/>refresh / persistence / export messages]
+    end
+    subgraph Protocols
+        P1[SystemInfoProviding]
+        P2[SnapshotStoring]
+    end
+    subgraph Implementations
+        S1[SystemInfoService<br/>ProcessInfo, Host, sysctlbyname,<br/>FileManager.attributesOfFileSystem]
+        S2[JSONSnapshotStore<br/>Application Support/MacSystemSnapshot/snapshots.json]
+        S3[SnapshotExporter<br/>NSSavePanel]
+    end
+    subgraph Model
+        M1[SystemSnapshot<br/>Codable, Identifiable, Equatable]
+        M2[SnapshotHistory<br/>dedupe by id, keep latest 10]
+        M3[SnapshotJSON<br/>shared encoder / decoder]
+        M4[SnapshotFormatting<br/>GiB, GB, percent, timestamp]
+    end
 
-`JSONSnapshotStore` implements `SnapshotStoring` and persists history under Application Support. `SnapshotJSON` centralizes serialization settings, and `SnapshotExporter` handles the native save dialog and export. `SnapshotHistory` limits and deduplicates records.
+    A --> CV --> DV
+    CV --> VM
+    VM --> P1 & P2 & S3
+    P1 -.-> S1
+    P2 -.-> S2
+    VM --> M2
+    S2 --> M3
+    S3 --> M3
+    CV & DV --> M4
+    S1 & S2 & S3 --> M1
+```
 
-`@StateObject` preserves the ViewModel at the app level. The view observes it through `@ObservedObject`; changes to its published history and selection trigger UI updates. The ViewModel is isolated to `@MainActor`.
+- **Dependency injection through protocols.** `SnapshotViewModel` receives a
+  `SystemInfoProviding` and a `SnapshotStoring`. The app composes the real `SystemInfoService`
+  and `JSONSnapshotStore` in `MacSystemSnapshotApp`; the tests pass a stub provider and an
+  in-memory store to drive success and failure paths deterministically.
+- **One owner for state.** The ViewModel is a `@MainActor` `ObservableObject` held in a
+  `@StateObject` at the app level. Views observe it with `@ObservedObject`; all mutations happen
+  on the main actor, which is also why the synchronous collection and the small file writes run
+  there without extra synchronisation.
+- **History rules in one place.** `SnapshotHistory.keepingLatest` deduplicates by UUID (first
+  occurrence wins) and truncates to ten. It is applied on load, after each capture, on save and
+  when merging after a recovered read failure, so every path agrees on what "the history" is.
+- **Separate error channels.** Refresh, persistence and export each publish their own optional
+  message, so a failed save does not hide a successful capture and the banners can offer the
+  correct retry action.
 
-## Development milestones
+### Refresh and persistence flow
 
-| Milestone | Scope | Status |
+```mermaid
+sequenceDiagram
+    participant V as ContentView
+    participant VM as SnapshotViewModel
+    participant P as SystemInfoProviding
+    participant S as SnapshotStoring
+
+    V->>VM: loadIfNeeded() on first appearance
+    VM->>S: load()
+    alt history readable
+        S-->>VM: [SystemSnapshot]
+        Note over VM: didReadHistory = true
+    else read fails
+        S-->>VM: error
+        Note over VM: persistenceErrorMessage set,<br/>file is never overwritten
+    end
+    VM->>P: captureSnapshot()
+    alt capture succeeds
+        P-->>VM: SystemSnapshot
+        Note over VM: prepend, keep latest 10, select it
+        opt didReadHistory
+            VM->>S: save(snapshots)
+        end
+    else capture fails
+        P-->>VM: error
+        Note over VM: refreshErrorMessage set,<br/>existing snapshots unchanged
+    end
+    V->>VM: retrySavingHistory()
+    Note over VM: if history was never read: load, merge<br/>in-memory captures first, then save
+```
+
+### Data collection
+
+| Value | Source | Notes |
 | --- | --- | --- |
-| 1 | Model, system service, ViewModel, basic interface, refresh | Implemented; local launch confirmed |
-| 2 | Refined interface, logical sections, storage visualization, error presentation | Implemented; local execution confirmed |
-| 3 | JSON persistence, last ten snapshots, history selection, JSON export | Implemented; local execution confirmed |
-| 4 | XCTest coverage and final project documentation | Implemented; 16 tests passed locally |
+| Device name | `Host.current().localizedName` | Falls back to `Unknown Mac` when empty. |
+| macOS version | `ProcessInfo.operatingSystemVersion` | Formatted as `major.minor.patch`. |
+| Architecture | `sysctlbyname("hw.optional.arm64")` | Reports the hardware, not the process (so `arm64` even under Rosetta). Missing key on Intel maps to `x86_64`. |
+| Active processors | `ProcessInfo.activeProcessorCount` | Logical cores currently active. |
+| Physical memory | `ProcessInfo.physicalMemory` | Displayed in GiB (binary units). |
+| Disk total / available | `FileManager.attributesOfFileSystem(forPath:)` for the home directory, `.systemSize` and `.systemFreeSize` | Displayed in GB (decimal units). Values are validated: total > 0, available ≤ total, otherwise the capture fails with `invalidDiskInformation`. |
 
-### Milestone 1 — System collection and basic UI · Implemented
+`availableDiskFraction` is a computed property (0…1 or `nil`), so it never reaches the JSON.
+Byte counts stay numeric in the model; formatting happens in `SnapshotFormatting` with the
+current locale.
 
-Implemented flow: an initial load or manual refresh requests a new snapshot. Collection failures are displayed without discarding the previous result.
+### Persistence and export
 
-```mermaid
-flowchart TD
-    A["Initial load or Refresh"] --> B["SnapshotViewModel"]
-    B --> C["SystemInfoProviding"]
-    C --> D["SystemInfoService: Apple APIs"]
-    D --> E{"Collection succeeded?"}
-    E -->|Yes| F["Publish new SystemSnapshot"]
-    E -->|No| G["Publish error; keep previous snapshot"]
-    F --> H["ContentView updates"]
-    G --> H
+- History lives at `Application Support/MacSystemSnapshot/snapshots.json` inside the sandbox
+  container, written atomically. `JSONSnapshotStore.load` treats a missing file as an empty
+  history, and rejects files with duplicate ids or impossible disk values.
+- Both history and export use `SnapshotJSON`: pretty-printed, sorted keys, dates as
+  milliseconds since 1970. An exported file is one object; the history file is an array.
+- Export writes only to the location chosen in the save panel; cancelling is not an error.
+
+## Technology
+
+| Component | Choice |
+| --- | --- |
+| Language / UI | Swift 5, SwiftUI (`NavigationSplitView`, `ContentUnavailableView`, `GroupBox`, `LazyVGrid`) |
+| System access | Foundation (`ProcessInfo`, `Host`, `FileManager`), Darwin (`sysctlbyname`) |
+| Reactive state | Combine `ObservableObject` / `@Published`, `@MainActor` |
+| Export dialog | AppKit `NSSavePanel`, UniformTypeIdentifiers |
+| Persistence | `Codable` + `JSONEncoder`/`JSONDecoder`, atomic file writes |
+| Security | App Sandbox with user-selected read/write files; `PrivacyInfo.xcprivacy` declares the disk-space API reason |
+| Tests | XCTest |
+
+No third-party packages, shell subprocesses, networking or database.
+
+## Getting started
+
+### Requirements
+
+- macOS 14.0 or later (deployment target of the app target).
+- Xcode 15 or later with the macOS SDK. Verified with Xcode 26.0.1 on Apple silicon.
+
+### Build and run
+
+Open `MacSystemSnapshot.xcodeproj`, select the `MacSystemSnapshot` scheme and **My Mac**, and
+press `⌘R`. Xcode's automatic signing with your development team is enough; the project already
+has App Sandbox enabled with user-selected files set to read/write for the export panel.
+
+From the command line, an ad-hoc signed debug build and the full test run look like this:
+
+```bash
+xcodebuild build -scheme MacSystemSnapshot -destination 'platform=macOS' \
+  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=
+
+xcodebuild test -scheme MacSystemSnapshot -destination 'platform=macOS,arch=arm64' \
+  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=
 ```
 
-<img width="672" height="574" alt="image-1" src="https://github.com/user-attachments/assets/6d012e32-ddad-4153-9524-28ca1662528f" />
+If `xcodebuild` reports that the active developer directory is the Command Line Tools, prefix
+the commands with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
 
-### Milestone 2 — Interface refinement · Implemented
+### Using the app
 
-Implemented: System, Memory, and Storage sections; adaptive cards; consistent spacing and typography; disk availability with a calculated percentage; a native refresh toolbar; and dedicated empty and error states. `SnapshotDetailView` displays a snapshot independently of collection logic. System colors support light and dark appearance. No loading spinner is used for the current synchronous collection operation.
-
-```mermaid
-flowchart TD
-    A["Published ViewModel state"] --> B{"Snapshot available?"}
-    B -->|Yes| C["System, memory, and storage sections"]
-    B -->|No| D["Empty state with Refresh action"]
-    A --> E{"Error present?"}
-    E -->|Yes| F["Visible error message"]
-    C --> G["Responsive window layout"]
-    D --> G
-    F --> G
-```
-
-<img width="1048" height="819" alt="image-2" src="https://github.com/user-attachments/assets/1e16e18f-0a78-49fd-8173-3b1e2fe0bb17" />
-
-### Milestone 3 — History and JSON export · Implemented
-
-Implemented: history is loaded from and saved to JSON in the sandbox container’s Application Support directory. The sidebar retains the latest ten captures and supports selecting previous records. Export writes the selected snapshot through `NSSavePanel`. Read, write, and export failures have separate messages. If history cannot be read, new captures remain in memory and the existing file is protected from automatic overwrite.
-
-```mermaid
-flowchart TD
-    A["App launch"] --> B["Load history from internal JSON"]
-    B --> C["History in ViewModel"]
-    D["Successful refresh"] --> E["Add snapshot; retain latest ten"]
-    E --> C
-    E --> J{"History read successfully?"}
-    J -->|Yes| F["Save internal JSON"]
-    J -->|No| K["Keep captures in memory; preserve file"]
-    C --> G["Select and display snapshot"]
-    G --> H["Export through system file dialog"]
-    B -.->|Read failure| I["Display operation-specific error"]
-    F -.->|Write failure| I
-    H -.->|Export failure| I
-```
-
-<!-- Add docs/screenshots/image-3.png, then uncomment the image below. -->
-<!-- ![Snapshot history and selected snapshot](docs/screenshots/image-3.png) -->
-
-### Milestone 4 — Tests and repository preparation · Implemented
-
-Implemented: 16 XCTest tests cover memory and disk formatting, free-space boundaries, JSON round trips, history limits, storage validation, and ViewModel success and recovery paths. Storage tests use unique temporary directories; ViewModel tests inject a controlled provider and an in-memory store. All 16 tests passed locally. Shared formatting, serialization, and history rules keep these behaviors independently testable.
-
-## Requirements
-
-- macOS 14.0 or later.
-- Xcode with the macOS SDK and support for the project's deployment target.
-- No external dependencies or paid services.
-
-Development, local application runs, and the XCTest run were performed on a MacBook Air M3. Intel and Rosetta execution have not been verified.
-
-## Running the application
-
-1. Clone or download this repository.
-2. Open `MacSystemSnapshot.xcodeproj` in Xcode.
-3. Select the `MacSystemSnapshot` scheme and the **My Mac** destination.
-4. Keep **App Sandbox** enabled under the app target's **Signing & Capabilities** settings.
-5. Under App Sandbox, set **User Selected File** to **Read/Write** for export.
-6. If Xcode requests signing configuration, select your development team.
-7. Choose **Product > Run** or press **Command-R** in Xcode.
-
-At launch, the app restores history and attempts a new capture. Use **Refresh** to capture and save another snapshot, select a history row to inspect it, and use **Export** to save that selected record separately. The oldest record is removed when the ten-record limit is exceeded. Unsaved changes remain available in memory but may be lost on quit.
+The app restores history and takes a capture on launch. `Refresh` (`⌘R`) adds another and
+drops the oldest beyond ten. Select a row to inspect an earlier capture; `Export` (`⌘E`) saves
+the selected one as JSON. If a banner appears, its button retries exactly the failed operation.
 
 ## Testing
 
-**Latest local result: 16 tests passed.**
+```bash
+xcodebuild test -scheme MacSystemSnapshot -destination 'platform=macOS,arch=arm64' \
+  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=
+```
 
-1. Open `MacSystemSnapshot.xcodeproj` in Xcode.
-2. Select the `MacSystemSnapshot` scheme and **My Mac**.
-3. Choose **Product > Test** or press **Command-U**.
-4. View results in the Test Navigator. The scheme's Test action must include `MacSystemSnapshotTests`.
+Or `⌘U` in Xcode. The suite has 16 tests in three files plus the two placeholder tests Xcode
+generates in `MacSystemSnapshotTests.swift`; all 18 pass.
 
-| Test suite | Tests | Coverage |
+| Suite | Tests | What it checks |
 | --- | ---: | --- |
-| `SnapshotLogicTests` | 7 | Binary memory units, decimal disk units and rounding, free-space boundaries, percentage formatting, JSON fields and timestamp encoding, history order and deduplication |
-| `SnapshotStoreTests` | 4 | Missing history, saving and reloading ten records, unchanged corrupt files, invalid disk values |
-| `SnapshotViewModelTests` | 5 | Initial load and capture, failed refresh, failed save and retry, failed load and recovery, history selection |
+| `SnapshotLogicTests` | 7 | Binary memory and decimal disk formatting with rounding, `availableDiskFraction` boundaries and invalid input, percentage formatting, JSON round trip including the millisecond timestamp and the absence of the computed property, history order and deduplication |
+| `SnapshotStoreTests` | 4 | Missing file yields empty history, save then reload keeps ten, corrupt JSON throws and leaves the file byte-identical, impossible disk values are rejected |
+| `SnapshotViewModelTests` | 5 | Launch loads, captures and saves; failed refresh keeps history and selection; failed save keeps the capture and retry persists it; failed load protects the file and retry merges; selecting an older snapshot neither captures nor saves |
 
-`TestSupport.swift` provides fixed sample data, a controllable system-information provider, an in-memory store, and temporary-directory setup and cleanup. Storage tests do not use the app's real history directory. Native save-dialog behavior remains a manual check; the suite does not automate the UI or validate hardware readings on every Mac model.
-
-### Manual verification checklist
-
-- Launch with App Sandbox enabled.
-- Compare the device name, macOS version, and installed memory with the Mac's settings.
-- Confirm that disk values are nonnegative and available space does not exceed total space.
-- Refresh after a few seconds and check that the timestamp changes.
-- Resize the window and check that cards switch between one and two columns.
-- Check light and dark appearance.
-- Compare the available percentage with available bytes divided by total bytes.
-- Create more than ten captures and confirm that only ten remain.
-- Quit and relaunch; confirm that history is restored and a new capture is added.
-- Select an older capture and export it; compare its ID and timestamp with the selected record.
-- Cancel export and confirm that no failure or success is reported.
-
+`TestSupport.swift` provides a fixture builder, a stub provider whose result can be flipped
+between success and failure, an in-memory store that counts save attempts, and a helper that
+creates and removes a temporary directory per storage test. The real history directory is never
+touched by tests. The save panel is not covered by automated tests.
 
 ## Project structure
 
-Source paths below are relative to the `MacSystemSnapshot` application directory.
+```
+Mac-System-Snaphot/
+├── MacSystemSnapshot.xcodeproj
+├── MacSystemSnapshot/
+│   ├── MacSystemSnapshotApp.swift        # entry point, dependency composition, single window
+│   ├── Models/
+│   │   ├── SystemSnapshot.swift          # immutable Codable value, availableDiskFraction
+│   │   └── SnapshotHistory.swift         # dedupe + ten-record limit
+│   ├── Services/
+│   │   ├── SystemInfoProviding.swift     # protocol
+│   │   └── SystemInfoService.swift       # Foundation/Darwin collection, SystemInfoError
+│   ├── Persistence/
+│   │   ├── SnapshotStoring.swift         # protocol (@MainActor)
+│   │   ├── SnapshotStore.swift           # JSONSnapshotStore: validation, atomic writes
+│   │   └── SnapshotJSON.swift            # shared encoder/decoder settings
+│   ├── Export/SnapshotExporter.swift     # NSSavePanel export
+│   ├── Formatting/SnapshotFormatting.swift
+│   ├── ViewModels/SnapshotViewModel.swift
+│   ├── Views/
+│   │   ├── ContentView.swift             # sidebar, toolbar, banners, empty state
+│   │   └── SnapshotDetailView.swift      # header and cards
+│   ├── PrivacyInfo.xcprivacy
+│   └── Assets.xcassets
+├── MacSystemSnapshotTests/
+│   ├── TestSupport.swift
+│   ├── SnapshotLogicTests.swift
+│   ├── SnapshotStoreTests.swift
+│   └── SnapshotViewModelTests.swift
+└── docs/screenshots/
+```
 
-| Path | Responsibility |
-| --- | --- |
-| `MacSystemSnapshotApp.swift` | App entry point, dependency composition, single main window |
-| `Models/SystemSnapshot.swift` | Immutable, Codable snapshot model |
-| `Models/SnapshotHistory.swift` | Ordered deduplication and ten-record limit |
-| `Persistence/SnapshotJSON.swift` | Shared JSON encoder and decoder settings |
-| `Persistence/SnapshotStoring.swift` | History storage contract |
-| `Persistence/JSONSnapshotStore.swift` | Validated JSON history and atomic writes |
-| `Export/SnapshotExporter.swift` | Native save dialog and selected-snapshot export |
-| `Services/SystemInfoProviding.swift` | System-information provider contract |
-| `Services/SystemInfoService.swift` | Foundation and Darwin API access; collection errors |
-| `ViewModels/SnapshotViewModel.swift` | Observable history, selection, refresh, persistence, and export coordination |
-| `Formatting/SnapshotFormatting.swift` | Memory, disk, percentage, and timestamp formatting |
-| `Views/ContentView.swift` | Page composition, toolbar, empty and error states |
-| `Views/SnapshotDetailView.swift` | Device header, adaptive system and memory cards, storage indicator |
-| `PrivacyInfo.xcprivacy` | Declared reason for accessing disk-space APIs |
-| `Assets.xcassets` | App visual resources |
+## Limitations
 
-The repository root contains `MacSystemSnapshot.xcodeproj`, `.gitignore`, and this README. The separate `MacSystemSnapshotTests` directory contains:
-
-| File | Responsibility |
-| --- | --- |
-| `TestSupport.swift` | Fixtures, test dependencies, and temporary-directory helper |
-| `SnapshotLogicTests.swift` | Formatting, calculations, JSON, and history rules |
-| `SnapshotStoreTests.swift` | File-backed storage checks in isolated temporary directories |
-| `SnapshotViewModelTests.swift` | State transitions and failure/retry behavior |
-
-Screenshots may be stored under `docs/screenshots/`. Xcode configuration and entitlements belong in version control; build output and personal workspace state are excluded through `.gitignore`.
-
-## Implementation notes
-
-- **Snapshot semantics:** each successful capture creates a new UUID and timestamp. Values are read sequentially, not as an atomic operating-system snapshot.
-- **Raw data and presentation:** byte counts remain numeric in the model. Memory is displayed in GiB and disk space in decimal GB; display formatting follows the current locale.
-- **Storage scope:** disk values describe the filesystem containing the app's home directory. Available space uses `systemFreeSize` and may differ from Finder's estimate of available space including reclaimable storage.
-- **Architecture:** the service queries `hw.optional.arm64` through Darwin rather than relying only on the compiled process architecture.
-- **Error handling:** collection errors are propagated to the ViewModel. An unavailable device name uses `Unknown Mac`; unreadable or inconsistent disk information produces an error.
-- **Execution:** collection and the small history-file operations run synchronously on the main actor. The export dialog is modal. No directory scanning or background polling is performed; larger datasets would warrant revisiting this choice.
-- **Derived values:** `availableDiskFraction` computes a value from 0 to 1, returning `nil` for invalid disk inputs. It is a computed property and is not included in synthesized Codable output.
-- **Serialization:** history is a JSON array; export is one JSON object. Dates use milliseconds since the Unix epoch. Both paths share the same codec settings.
-- **History ordering:** new captures are prepended. Deduplication preserves the first occurrence of each UUID, then keeps at most ten records; records are not sorted by the wall clock.
-- **Persistence:** internal data is stored at `MacSystemSnapshot/snapshots.json` beneath the sandbox’s Application Support directory, resolved through FileManager. Writes use `.atomic`.
-- **Recovery:** a missing history file means an empty history. Invalid JSON and other read failures remain visible errors. Retry save first reloads unread history and merges it with in-memory captures before writing. In-memory captures take priority, and the merged history is still limited to ten records.
-- **Export:** only the user-selected destination is written. Canceling the save dialog is treated as cancellation, not an error. No persistent access bookmark is needed for a one-time export.
+- **Not an atomic snapshot.** Values are read one after another; a capture is a few
+  milliseconds wide, not a single OS-level snapshot.
+- **Available space may differ from Finder.** `systemFreeSize` does not include purgeable
+  space, so Finder's "available" figure is usually larger.
+- **Main-thread I/O.** Collection and the history file write run synchronously on the main
+  actor. This is fine for a ten-record JSON file and would need to move off the main thread
+  for anything larger.
+- **Window size is restored by the system.** The saved frame wins over the default 820×680
+  size, so the storage card may start below the fold.
+- **Test target deployment target.** The test target is set to macOS 26.0 while the app target
+  is 14.0; the tests only run on recent systems.
+- **Intel and Rosetta not verified.** Developed and tested on Apple silicon only.
