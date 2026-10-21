@@ -14,8 +14,6 @@ that exercises the ViewModel through injected fakes.
 
 Captures of the app built from this repository and running on macOS 27 (Apple silicon).
 
-![Launch sequence: empty state, then history restored and a fresh capture selected](docs/screenshots/launch.gif)
-
 ![Main window with the ten-entry history sidebar and the selected snapshot](docs/screenshots/01-main-window.png)
 
 ![History file deliberately corrupted before launch: the app keeps the new capture in memory, leaves the file untouched and offers Retry save](docs/screenshots/02-history-error.png)
